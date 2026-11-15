@@ -1,0 +1,12 @@
+{
+  "listen_host": "0.0.0.0",
+  "listen_port": 8321,
+  "token": "请改成与网站后台「欲蓝服务器口令」完全一致的一串字符（至少 6 位）",
+  "log_dir": "",
+  "default_role": "user",
+  "admin_products": [],
+  "admin_group_name": "administrators",
+  "rdp_group_name": "Remote Desktop Users",
+  "server_ip": "",
+  "use_powershell": false
+}
