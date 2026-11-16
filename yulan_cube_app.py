@@ -15,6 +15,11 @@
          - 管理员：  额外执行 net localgroup administrators 用户名 /add
          - 两者都要：net localgroup "Remote Desktop Users" 用户名 /add
   5. 返回统一结果：{"ok": true/false, "role": "user"|"admin", "detail": "..."}
+  6. 收到改号请求（用户在网站「控制台 / 商品详情」里修改）后，以管理员权限强制修改：
+         - 改密码：net user 账号 新密码                    （不需旧密码，管理员强制重置）
+         - 改用户名：Rename-LocalUser -Name '旧' -NewName '新'（可切 wmic 兼容老系统）
+     改名不改 SID，管理员组 / 远程桌面组成员关系自动保留；网站端不存储密码，
+     所以改密一律是「管理员强制重置」，无需也不校验旧密码。
 
 安全基线（与网站端约定一致）：
   - 日志中【绝不】记录口令，也【绝不】记录鉴权 Token。
@@ -51,6 +56,7 @@ from urllib.parse import urlparse
 DEFAULT_PORT = 8321
 DEFAULT_HOST = "0.0.0.0"
 CONFIG_FILENAME = "yulan_cube_config.json"
+APP_VERSION = "1.2.0"
 
 # Windows 已知 SID
 SID_SYSTEM = "S-1-5-18"          # SYSTEM
@@ -186,7 +192,8 @@ def default_config() -> dict:
         "admin_group_name": "administrators",   # 中文 Windows 可改为「管理员」
         "rdp_group_name": "Remote Desktop Users",  # 中文 Windows 可改为「远程桌面用户」
         "server_ip": "",             # 本机对外 IP（仅用于展示，网站后台另存）
-        "use_powershell": False,     # True 时改用 PowerShell 建号（口令不进入进程参数）
+        "use_powershell": False,     # True 时改用 PowerShell 建号/改密（口令不进入进程参数）
+        "rename_method": "powershell",  # 改用户名方式：powershell（Rename-LocalUser）/ wmic（老系统）
     }
 
 
@@ -220,7 +227,7 @@ def decide_role(cfg: dict, product_id: str) -> str:
 
 
 # ----------------------------------------------------------------------------
-# 4) Windows 账号创建（net user / net localgroup）
+# 4) Windows 账号创建 / 修改（net user / net localgroup / Rename-LocalUser）
 # ----------------------------------------------------------------------------
 def _validate_account(account: str) -> bool:
     import re
@@ -228,11 +235,17 @@ def _validate_account(account: str) -> bool:
 
 
 def _mask_password(args: list) -> list:
-    """生成用于日志的「脱敏」参数副本：绝不打印明文口令。"""
+    """生成用于日志的「脱敏」参数副本：绝不打印明文口令。
+
+    覆盖三种含口令的命令：
+      - net user 账号 密码 /add      （建号，5 参数，索引 3 是密码）
+      - net user 账号 新密码         （改密，4 参数，索引 3 是密码）
+      - PowerShell ConvertTo-SecureString '密码'  （脚本内明文，正则脱敏）
+    """
     import re
     a = list(args)
-    # net user 用户名 密码 /add  → 第 4 个位置（索引 3）是密码，脱敏
-    if len(a) >= 5 and a[0] == "net" and a[1] == "user":
+    # 改密命令只有 4 个参数，阈值必须是 >=4（旧版 >=5 会漏掉改密，导致明文进日志）
+    if len(a) >= 4 and a[0] == "net" and a[1] == "user":
         a[3] = "***"
     # PowerShell 脚本中的明文口令同样脱敏
     for i, v in enumerate(a):
@@ -275,6 +288,20 @@ def _ps_script(account: str, password: str, role: str, admin_grp: str, rdp_grp: 
            if role == "admin" else "")
         + "exit 0"
     )
+
+
+def _ps_set_password(account: str, password: str) -> str:
+    """PowerShell 版改密脚本：管理员强制重置，不需要旧密码。"""
+    return (
+        f"$pw = ConvertTo-SecureString '{password}' -AsPlainText -Force; "
+        f"Set-LocalUser -Name '{account}' -Password $pw -ErrorAction Stop; "
+        "exit 0"
+    )
+
+
+def _ps_rename(old: str, new: str) -> str:
+    """PowerShell 版改名脚本：只改登录名，SID 与组关系不变。"""
+    return f"Rename-LocalUser -Name '{old}' -NewName '{new}' -ErrorAction Stop; exit 0"
 
 
 def create_windows_account(account: str, password: str, role: str, cfg: dict,
@@ -328,6 +355,74 @@ def create_windows_account(account: str, password: str, role: str, cfg: dict,
     return True, f"账号已创建（角色={role}）"
 
 
+def update_windows_account(account: str, new_account: str, new_password: str, cfg: dict,
+                           logger: AppLogger, dry_run: bool) -> tuple[bool, dict]:
+    """
+    以管理员权限强制修改已创建的账号（网站「控制台 / 商品详情」调用）。
+
+    请求字段：
+      account       当前账号名（旧名）
+      new_account   新账号名（可选，空=不改）
+      new_password  新密码（可选，空=不改）
+
+    返回 (是否全部成功, {password_changed, renamed, final_account, detail})。
+    顺序：先改密（用旧名），再改名 —— 改名后旧登录名即失效。
+    """
+    res = {
+        "password_changed": False,
+        "renamed": False,
+        "final_account": account,
+        "detail": "",
+    }
+
+    if not _validate_account(account):
+        return False, {**res, "detail": "原账号名不合法"}
+    if not new_account and not new_password:
+        return False, {**res, "detail": "没有需要修改的内容（请提供新账号名或新密码）"}
+    if new_account and new_account == account:
+        return False, {**res, "detail": "新账号名与原账号名相同，无需修改"}
+    if new_account and not _validate_account(new_account):
+        return False, {**res, "detail": "新账号名不合法（仅允许 1-20 位字母数字及 . _ -）"}
+    if new_password and len(new_password) < 6:
+        return False, {**res, "detail": "新密码长度不足（至少 6 位）"}
+
+    use_ps = bool(cfg.get("use_powershell"))
+    details = []
+
+    # 1) 改密码：net user 账号 新密码（不带 /add，管理员强制重置，不需旧密码）
+    if new_password:
+        if use_ps:
+            cmd = ["powershell", "-NoProfile", "-Command",
+                   _ps_set_password(account, new_password)]
+        else:
+            cmd = ["net", "user", account, new_password]
+        rc, out = _run_cmd(cmd, False, logger, dry_run)
+        if rc != 0:
+            return False, {**res, "detail": f"改密码失败：{out}"}
+        res["password_changed"] = True
+        details.append("密码已重置")
+
+    # 2) 改用户名：Rename-LocalUser（SID 不变，管理员组/远程桌面组关系保留）
+    if new_account:
+        method = str(cfg.get("rename_method") or "powershell").lower()
+        if method == "wmic":
+            # 兼容未安装 PowerShell LocalAccounts 模块的老系统
+            cmd = ["wmic", "useraccount", "where", f"name='{account}'",
+                   "call", "Rename", new_account]
+        else:
+            cmd = ["powershell", "-NoProfile", "-Command", _ps_rename(account, new_account)]
+        rc, out = _run_cmd(cmd, False, logger, dry_run)
+        if rc != 0:
+            # 改密已成功、改名失败：如实返回部分结果，网站端据此提示用户
+            tail = "（密码修改已生效）" if res["password_changed"] else ""
+            return False, {**res, "detail": f"改用户名失败：{out}{tail}"}
+        res["renamed"] = True
+        res["final_account"] = new_account
+        details.append(f"用户名已改为 {new_account}")
+
+    return True, {**res, "detail": "；".join(details) or "无修改"}
+
+
 # ----------------------------------------------------------------------------
 # 5) HTTP 服务
 # ----------------------------------------------------------------------------
@@ -338,7 +433,7 @@ def make_handler(cfg: dict, logger: AppLogger, dry_run: bool):
         protocol_version = "HTTP/1.1"
 
         # 不向客户端暴露服务器版本
-        server_version = "YulanCube/1.0"
+        server_version = "YulanCube/1.2"
 
         def log_message(self, fmt, *args):  # 覆盖默认 stderr 日志，统一走 AppLogger
             return
@@ -381,6 +476,8 @@ def make_handler(cfg: dict, logger: AppLogger, dry_run: bool):
                 self._send_json(200, {
                     "ok": True,
                     "service": "yulan-cube",
+                    "version": APP_VERSION,
+                    "capabilities": ["create-user", "update-user"],
                     "default_role": decide_role(cfg, ""),
                     "admin_products": cfg.get("admin_products", []),
                     "server_ip": cfg.get("server_ip", ""),
@@ -390,7 +487,7 @@ def make_handler(cfg: dict, logger: AppLogger, dry_run: bool):
 
         def do_POST(self):
             path = urlparse(self.path).path
-            if path != "/api/v1/create-user":
+            if path not in ("/api/v1/create-user", "/api/v1/update-user"):
                 self._send_json(404, {"ok": False, "error": "not found"})
                 return
 
@@ -400,23 +497,54 @@ def make_handler(cfg: dict, logger: AppLogger, dry_run: bool):
                 return
 
             data = self._read_body()
-            order_no = str(data.get("order_no", ""))
-            product_id = str(data.get("product_id", ""))
+
+            # ---------- 建号 ----------
+            if path == "/api/v1/create-user":
+                order_no = str(data.get("order_no", ""))
+                product_id = str(data.get("product_id", ""))
+                account = str(data.get("account", ""))
+                password = str(data.get("password", ""))
+
+                # 日志中只记账号，绝不记密码 / Token
+                logger.info(
+                    f"建号请求 order_no={order_no} product_id={product_id} account={account}"
+                )
+
+                role = decide_role(cfg, product_id)
+                ok, detail = create_windows_account(
+                    account, password, role, cfg, logger, dry_run
+                )
+                logger.info(f"建号结果 ok={ok} role={role} detail={detail}")
+
+                self._send_json(200, {"ok": ok, "role": role, "detail": detail})
+                return
+
+            # ---------- 改号（管理员强制修改）----------
             account = str(data.get("account", ""))
-            password = str(data.get("password", ""))
+            new_account = str(data.get("new_account", ""))
+            new_password = str(data.get("new_password", ""))
+            order_no = str(data.get("order_no", ""))
 
-            # 日志中只记账号，绝不记密码 / Token
+            # 日志中只记账号与「改了哪些项」，绝不记明文口令
             logger.info(
-                f"建号请求 order_no={order_no} product_id={product_id} account={account}"
+                f"改号请求 order_no={order_no} account={account} "
+                f"改用户名={'是' if new_account else '否'} 改密码={'是' if new_password else '否'}"
             )
 
-            role = decide_role(cfg, product_id)
-            ok, detail = create_windows_account(
-                account, password, role, cfg, logger, dry_run
+            ok, res = update_windows_account(
+                account, new_account, new_password, cfg, logger, dry_run
             )
-            logger.info(f"建号结果 ok={ok} role={role} detail={detail}")
-
-            self._send_json(200, {"ok": ok, "role": role, "detail": detail})
+            logger.info(
+                f"改号结果 ok={ok} 改密={res['password_changed']} "
+                f"改名={res['renamed']} detail={res['detail']}"
+            )
+            self._send_json(200, {
+                "ok": ok,
+                "password_changed": res["password_changed"],
+                "renamed": res["renamed"],
+                "account": res["final_account"],
+                "detail": res["detail"],
+            })
 
     return Handler
 
@@ -451,11 +579,11 @@ def main() -> int:
     logger = AppLogger(log_dir, console=not args.no_console)
 
     logger.info("欲蓝财务魔方 APP 启动。"
-                f"监听={cfg.get('listen_port')} 默认角色={cfg.get('default_role')} "
+                f"版本={APP_VERSION} 监听={cfg.get('listen_port')} 默认角色={cfg.get('default_role')} "
                 f"管理员商品={cfg.get('admin_products')} "
                 f"dry_run={args.dry_run}")
     if not cfg.get("token"):
-        logger.warn("Token 未配置！任何建号请求都将被拒绝，请先在配置中填写与网站一致的口令。")
+        logger.warn("Token 未配置！任何建号/改号请求都将被拒绝，请先在配置中填写与网站一致的口令。")
 
     handler = make_handler(cfg, logger, args.dry_run)
 
@@ -470,6 +598,7 @@ def main() -> int:
         return 1
 
     logger.info(f"已监听 http://{cfg.get('listen_host')}:{cfg.get('listen_port')}/api/v1/create-user")
+    logger.info(f"          http://{cfg.get('listen_host')}:{cfg.get('listen_port')}/api/v1/update-user")
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:

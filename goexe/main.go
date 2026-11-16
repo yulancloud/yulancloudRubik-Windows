@@ -8,6 +8,9 @@
 //   - 监听 HTTP 端口，Bearer Token 鉴权
 //   - POST /api/v1/create-user：按 APP 配置决定普通/管理员角色，
 //     执行 net user / net localgroup 建号命令
+//   - POST /api/v1/update-user：以管理员权限强制修改已建账号
+//       改密码：net user 账号 新密码        （不需旧密码）
+//       改用户名：Rename-LocalUser          （可切 wmic 兼容老系统）
 //   - 日志一律脱敏：密码显示为 ***
 //
 // 命令契约（与网站端 YulanConnector 对接）：
@@ -34,7 +37,7 @@ import (
 	"time"
 )
 
-const appVersion = "1.0.0"
+const appVersion = "1.2.0"
 
 // ---------------- 配置 ----------------
 
@@ -47,15 +50,18 @@ type Config struct {
 	AdminGroup    string   `json:"admin_group_name"`
 	RDPGroup      string   `json:"rdp_group_name"`
 	ServerIP      string   `json:"server_ip"`
+	UsePowerShell bool     `json:"use_powershell"`
+	RenameMethod  string   `json:"rename_method"` // powershell / wmic
 }
 
 func loadConfig(path string) *Config {
 	cfg := &Config{
-		ListenHost:  "127.0.0.1",
-		ListenPort:  8321,
-		DefaultRole: "user",
-		AdminGroup:  "administrators",
-		RDPGroup:    "Remote Desktop Users",
+		ListenHost:   "127.0.0.1",
+		ListenPort:   8321,
+		DefaultRole:  "user",
+		AdminGroup:   "administrators",
+		RDPGroup:     "Remote Desktop Users",
+		RenameMethod: "powershell",
 	}
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -64,6 +70,9 @@ func loadConfig(path string) *Config {
 	}
 	if err := json.Unmarshal(data, cfg); err != nil {
 		fmt.Fprintf(os.Stderr, "[配置] 解析 %s 失败：%v，使用默认值。\n", path, err)
+	}
+	if cfg.RenameMethod == "" {
+		cfg.RenameMethod = "powershell"
 	}
 	return cfg
 }
@@ -78,6 +87,8 @@ func defaultConfigSample() []byte {
 		"admin_group_name":  "administrators",
 		"rdp_group_name":    "Remote Desktop Users",
 		"server_ip":         "填本机对外 IP，仅作备注",
+		"use_powershell":    false,
+		"rename_method":     "powershell",
 	}
 	b, _ := json.MarshalIndent(sample, "", "  ")
 	return b
@@ -91,6 +102,7 @@ type AppLogger struct {
 }
 
 var accountRe = regexp.MustCompile(`^[A-Za-z0-9._-]{1,20}$`)
+var secureStringRe = regexp.MustCompile(`ConvertTo-SecureString '[^']*'`)
 
 func (lg *AppLogger) write(level, msg string) {
 	line := fmt.Sprintf("[%s] [%s] %s\n", time.Now().Format("2006-01-02 15:04:05"), level, msg)
@@ -102,12 +114,18 @@ func (lg *AppLogger) write(level, msg string) {
 	fmt.Fprint(os.Stderr, line)
 }
 
+// maskNetArgs 生成用于日志的脱敏命令串，覆盖三种含口令的情况：
+//   - net user 账号 密码 /add   （建号）
+//   - net user 账号 新密码      （改密，4 参数，索引 3 是密码）
+//   - PowerShell ConvertTo-SecureString '密码'（脚本内明文）
 func maskNetArgs(args []string) string {
-	// net user 账号 密码 /add —— 第 4 个参数（索引 3）是密码，脱敏
 	out := make([]string, len(args))
 	copy(out, args)
 	if len(out) >= 4 && strings.EqualFold(out[0], "net") && strings.EqualFold(out[1], "user") {
 		out[3] = "***"
+	}
+	for i := range out {
+		out[i] = secureStringRe.ReplaceAllString(out[i], "ConvertTo-SecureString '***'")
 	}
 	return strings.Join(out, " ")
 }
@@ -142,6 +160,20 @@ type createUserReq struct {
 	Password  string `json:"password"`
 }
 
+type updateUserReq struct {
+	OrderNo     string `json:"order_no"`
+	Account     string `json:"account"`      // 当前账号名（旧名）
+	NewAccount  string `json:"new_account"`  // 新账号名（可选）
+	NewPassword string `json:"new_password"` // 新密码（可选）
+}
+
+type updateResult struct {
+	PasswordChanged bool
+	Renamed         bool
+	FinalAccount    string
+	Detail          string
+}
+
 type Server struct {
 	cfg    *Config
 	logger *AppLogger
@@ -158,11 +190,12 @@ func (s *Server) decideRole(productID string) string {
 }
 
 func (s *Server) runCmd(name string, args ...string) (int, string, error) {
+	all := append([]string{name}, args...)
 	if s.dryRun {
-		s.logger.write("INFO", "[DRY-RUN] 将执行："+maskNetArgs(append([]string{name}, args...)))
+		s.logger.write("INFO", "[DRY-RUN] 将执行："+maskNetArgs(all))
 		return 0, "[dry-run] 未真正执行", nil
 	}
-	s.logger.write("INFO", "执行命令："+maskNetArgs(append([]string{name}, args...)))
+	s.logger.write("INFO", "执行命令："+maskNetArgs(all))
 	out, err := exec.Command(name, args...).CombinedOutput()
 	text := strings.TrimSpace(string(out))
 	if err != nil {
@@ -171,22 +204,29 @@ func (s *Server) runCmd(name string, args ...string) (int, string, error) {
 	return 0, text, nil
 }
 
-func (s *Server) handleCreateUser(w http.ResponseWriter, r *http.Request) {
-	// Bearer 鉴权（常数时间比较，防时序侧信道）
+// authOK 恒定时间比较 Bearer Token，防时序侧信道
+func (s *Server) authOK(r *http.Request) bool {
 	auth := r.Header.Get("Authorization")
 	const prefix = "Bearer "
-	ok := len(auth) > len(prefix) && strings.EqualFold(auth[:len(prefix)], prefix) &&
+	return len(auth) > len(prefix) && strings.EqualFold(auth[:len(prefix)], prefix) &&
 		subtle.ConstantTimeCompare([]byte(auth[len(prefix):]), []byte(s.cfg.Token)) == 1
-	if !ok {
+}
+
+func readBody(r *http.Request) []byte {
+	body := make([]byte, 65536)
+	n, _ := r.Body.Read(body)
+	return body[:n]
+}
+
+func (s *Server) handleCreateUser(w http.ResponseWriter, r *http.Request) {
+	if !s.authOK(r) {
 		s.logger.write("WARN", "鉴权失败：Token 无效，已拒绝请求")
 		writeJSON(w, http.StatusUnauthorized, map[string]any{"ok": false, "error": "unauthorized"})
 		return
 	}
 
 	var req createUserReq
-	body := make([]byte, 65536)
-	n, _ := r.Body.Read(body)
-	if err := json.Unmarshal(body[:n], &req); err != nil {
+	if err := json.Unmarshal(readBody(r), &req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "invalid_json"})
 		return
 	}
@@ -248,6 +288,121 @@ func (s *Server) handleCreateUser(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "role": role, "detail": strings.Join(detailParts, "；")})
 }
 
+// handleUpdateUser 以管理员权限强制修改已建账号（网站「控制台 / 商品详情」调用）。
+// 顺序：先改密（用旧名），再改名 —— 改名后旧登录名即失效。
+func (s *Server) handleUpdateUser(w http.ResponseWriter, r *http.Request) {
+	if !s.authOK(r) {
+		s.logger.write("WARN", "改号鉴权失败：Token 无效，已拒绝请求")
+		writeJSON(w, http.StatusUnauthorized, map[string]any{"ok": false, "error": "unauthorized"})
+		return
+	}
+
+	var req updateUserReq
+	if err := json.Unmarshal(readBody(r), &req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "invalid_json"})
+		return
+	}
+
+	res := updateResult{FinalAccount: req.Account}
+
+	// ---- 参数校验 ----
+	if !accountRe.MatchString(req.Account) {
+		writeJSON(w, http.StatusOK, s.failUpdate(res, "原账号名不合法"))
+		return
+	}
+	if req.NewAccount == "" && req.NewPassword == "" {
+		writeJSON(w, http.StatusOK, s.failUpdate(res, "没有需要修改的内容（请提供新账号名或新密码）"))
+		return
+	}
+	if req.NewAccount != "" && req.NewAccount == req.Account {
+		writeJSON(w, http.StatusOK, s.failUpdate(res, "新账号名与原账号名相同，无需修改"))
+		return
+	}
+	if req.NewAccount != "" && !accountRe.MatchString(req.NewAccount) {
+		writeJSON(w, http.StatusOK, s.failUpdate(res, "新账号名不合法（仅允许 1-20 位字母数字及 . _ -）"))
+		return
+	}
+	if req.NewPassword != "" && len(req.NewPassword) < 6 {
+		writeJSON(w, http.StatusOK, s.failUpdate(res, "新密码长度不足（至少 6 位）"))
+		return
+	}
+
+	s.logger.write("INFO", fmt.Sprintf(
+		"收到改号请求：订单 %s，账号 %s，改用户名=%v，改密码=%v",
+		req.OrderNo, req.Account, req.NewAccount != "", req.NewPassword != ""))
+
+	var details []string
+
+	// 1) 改密码：net user 账号 新密码（不带 /add，管理员强制重置，不需旧密码）
+	if req.NewPassword != "" {
+		var rc int
+		var out string
+		var err error
+		if s.cfg.UsePowerShell {
+			script := fmt.Sprintf("$pw = ConvertTo-SecureString '%s' -AsPlainText -Force; "+
+				"Set-LocalUser -Name '%s' -Password $pw -ErrorAction Stop; exit 0",
+				req.NewPassword, req.Account)
+			rc, out, err = s.runCmd("powershell", "-NoProfile", "-Command", script)
+		} else {
+			rc, out, err = s.runCmd("net", "user", req.Account, req.NewPassword)
+		}
+		if rc != 0 || err != nil {
+			s.logger.write("ERROR", fmt.Sprintf("改密码失败：账号 %s：%s %v", req.Account, out, err))
+			writeJSON(w, http.StatusOK, s.failUpdate(res, "改密码失败："+out))
+			return
+		}
+		res.PasswordChanged = true
+		details = append(details, "密码已重置")
+	}
+
+	// 2) 改用户名：Rename-LocalUser（SID 不变，管理员组/远程桌面组关系保留）
+	if req.NewAccount != "" {
+		var rc int
+		var out string
+		var err error
+		if strings.EqualFold(s.cfg.RenameMethod, "wmic") {
+			// 兼容未安装 PowerShell LocalAccounts 模块的老系统
+			rc, out, err = s.runCmd("wmic", "useraccount", "where", "name='"+req.Account+"'",
+				"call", "Rename", req.NewAccount)
+		} else {
+			script := fmt.Sprintf("Rename-LocalUser -Name '%s' -NewName '%s' -ErrorAction Stop; exit 0",
+				req.Account, req.NewAccount)
+			rc, out, err = s.runCmd("powershell", "-NoProfile", "-Command", script)
+		}
+		if rc != 0 || err != nil {
+			s.logger.write("ERROR", fmt.Sprintf("改用户名失败：账号 %s：%s %v", req.Account, out, err))
+			tail := ""
+			if res.PasswordChanged {
+				tail = "（密码修改已生效）"
+			}
+			writeJSON(w, http.StatusOK, s.failUpdate(res, "改用户名失败："+out+tail))
+			return
+		}
+		res.Renamed = true
+		res.FinalAccount = req.NewAccount
+		details = append(details, "用户名已改为 "+req.NewAccount)
+	}
+
+	res.Detail = strings.Join(details, "；")
+	if res.Detail == "" {
+		res.Detail = "无修改"
+	}
+	s.logger.write("INFO", fmt.Sprintf("改号完成：账号 %s，改密=%v，改名=%v",
+		res.FinalAccount, res.PasswordChanged, res.Renamed))
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok": true, "password_changed": res.PasswordChanged, "renamed": res.Renamed,
+		"account": res.FinalAccount, "detail": res.Detail,
+	})
+}
+
+func (s *Server) failUpdate(res updateResult, detail string) map[string]any {
+	res.Detail = detail
+	return map[string]any{
+		"ok": false, "password_changed": res.PasswordChanged, "renamed": res.Renamed,
+		"account": res.FinalAccount, "detail": res.Detail,
+	}
+}
+
 func firstLine(s string) string {
 	if i := strings.IndexByte(s, '\n'); i >= 0 {
 		s = s[:i]
@@ -266,6 +421,7 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("/api/v1/health", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{
 			"ok": true, "service": "yulan-cube-app", "version": appVersion,
+			"capabilities": []string{"create-user", "update-user"},
 			"role_decision": "app", "server_ip": s.cfg.ServerIP,
 		})
 	})
@@ -275,6 +431,13 @@ func (s *Server) routes() http.Handler {
 			return
 		}
 		s.handleCreateUser(w, r)
+	})
+	mux.HandleFunc("/api/v1/update-user", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"ok": false, "error": "method_not_allowed"})
+			return
+		}
+		s.handleUpdateUser(w, r)
 	})
 	return logRequest(mux, s.logger)
 }
@@ -340,6 +503,7 @@ func main() {
 
 	addr := fmt.Sprintf("%s:%d", cfg.ListenHost, cfg.ListenPort)
 	fmt.Printf("✓ 监听 http://%s  （健康检查：/api/v1/health）\n", addr)
+	fmt.Println("✓ 已开启建号 /api/v1/create-user 与改号 /api/v1/update-user")
 	fmt.Println("✓ 日志：" + logFile + "（已 ACL 隔离，普通用户不可见）")
 	if err := http.ListenAndServe(addr, srv.routes()); err != nil {
 		lg.write("ERROR", "HTTP 服务退出："+err.Error())

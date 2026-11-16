@@ -8,5 +8,6 @@
   "admin_group_name": "administrators",
   "rdp_group_name": "Remote Desktop Users",
   "server_ip": "",
-  "use_powershell": false
+  "use_powershell": false,
+  "rename_method": "powershell"
 }

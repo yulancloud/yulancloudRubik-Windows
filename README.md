@@ -1,6 +1,6 @@
 # 欲蓝财务魔方 APP（Windows 服务端）
 
-网站下单后，由本程序在 Windows 服务器上创建 Windows 账号。
+网站下单后，由本程序在 Windows 服务器上创建 Windows 账号；用户在网站「控制台」修改用户名/密码时，也由本程序以管理员权限强制修改。
 **推荐使用单文件版 `yulan_cube_app.exe`——不需要安装 Python，也不需要任何运行环境，拷过去就能跑。**
 
 ## 文件清单
@@ -43,6 +43,25 @@
 
 返回 `{"ok": true, "role": "user"|"admin", "detail": "..."}` 给网站。
 
+## 改号命令契约（v1.2 新增 · 用户中心「控制台」）
+
+用户在网站「用户中心 → 控制台 → 商品详情」里修改**登录用户名 / 密码**时，网站把命令发给本 APP，由 APP **以管理员权限强制修改**（网站不存储密码，所以改密一律是「管理员强制重置」，无需旧密码）：
+
+| 操作 | 命令 | 说明 |
+|---|---|---|
+| 改密码 | `net user 账号 新密码` | 不带 `/add`，管理员强制重置；不需要也不校验旧密码 |
+| 改用户名 | `Rename-LocalUser -Name '旧' -NewName '新'` | `net user` 不支持改名；用 PowerShell，SID 不变，管理员组 / 远程桌面组关系保留 |
+| 老系统兼容 | `wmic useraccount where "name='旧'" call Rename "新"` | 配置 `rename_method: "wmic"` 时启用（未装 PowerShell LocalAccounts 模块的老系统） |
+
+- 接口：`POST /api/v1/update-user`，同样要 `Authorization: Bearer {token}`
+- 请求：`{"order_no":"...","account":"旧名","new_account":"新名(可选)","new_password":"新密码(可选)"}`，两项至少一个非空
+- 响应：`{"ok":true,"password_changed":bool,"renamed":bool,"account":"最终账号名","detail":"..."}`
+- 顺序：**先改密（用旧名）、再改名**；改名后旧登录名即失效
+- 开启 `use_powershell: true` 时改密走 `Set-LocalUser` + `SecureString`（口令不进进程参数）
+- 日志一律脱敏：改密命令打印为 `net user 账号 ***`，PowerShell 脚本里的口令打印为 `***`
+
+> 健康检查 `/api/v1/health` 的 `capabilities` 会包含 `["create-user","update-user"]`，可据此判断 APP 是否已升级到支持改号的版本。
+
 ## 长期驻留（推荐）
 
 双击 bat 启动会开一个控制台窗口，关掉窗口程序就停了。长期运行建议二选一：
@@ -69,4 +88,4 @@ yulan_cube_app.exe --config yulan_cube_config.json --dry-run
 | 口令 | `token`（两边必须一致） |
 | 连接地址（RDP） | `server_ip` 仅作备注；网站后台的「连接地址」才是用户订单里显示的远程桌面地址 |
 
-> 每个欲蓝商品还可以在网站后台单独配置自己的服务器（IP/端口/口令/连接地址），留空则用全局默认——对应 APP 无需改动，只要那台服务器上也跑着一个 APP 实例即可
+> 每个欲蓝商品还可以在网站后台单独配置自己的服务器（IP/端口/口令/连接地址），留空则用全局默认——对应 APP 无需改动，只要那台服务器上也跑着一个 APP 实例即可。
