@@ -50,13 +50,30 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
+# Windows 控制台默认编码（cp1252/gbk）可能无法输出中文，强制 UTF-8 + 容错，
+# 避免帮助文本 / 日志因编码异常导致进程崩溃（表现为"双击闪退"）。
+try:
+    for _s in (sys.stdout, sys.stderr):
+        if hasattr(_s, "reconfigure"):
+            _s.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
+
 # ----------------------------------------------------------------------------
 # 常量
 # ----------------------------------------------------------------------------
 DEFAULT_PORT = 8321
 DEFAULT_HOST = "0.0.0.0"
 CONFIG_FILENAME = "yulan_cube_config.json"
-APP_VERSION = "1.2.1"
+APP_VERSION = "1.3.0"
+
+
+def app_dir() -> str:
+    """返回程序所在目录。源码运行时为脚本目录；PyInstaller 打包后为 exe 所在目录，
+    从而保证配置文件与日志始终落在 exe 旁边，而不是临时解压目录（_MEIPASS）。"""
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(os.path.abspath(sys.executable))
+    return os.path.dirname(os.path.abspath(__file__))
 
 # Windows 已知 SID
 SID_SYSTEM = "S-1-5-18"          # SYSTEM
@@ -75,12 +92,64 @@ def _now_iso() -> str:
 # 1) 管理员身份检查
 # ----------------------------------------------------------------------------
 def is_running_as_admin() -> bool:
-    """当前进程是否以管理员权限运行。非 Windows 环境返回 False（需配合 --allow-non-admin）。"""
-    try:
-        return ctypes.windll.shell32.IsUserAnAdmin() != 0
-    except Exception:
-        # 非 Windows（Linux/macOS）没有该 API
+    """当前账号是否具备管理员权限（多重判定，任一命中即通过）。
+
+    旧版只用 IsUserAnAdmin（内部即 CheckTokenMembership），在部分环境会被误判。
+    v1.3 改为多重判定，覆盖以下场景：
+      1) shell32.IsUserAnAdmin()              常规提权 / 管理员交互令牌
+      2) CheckTokenMembership(Administrators) 域账户 / runas / 未提权但属管理员组
+      3) 内置 Administrator（RID 500）SID
+    非 Windows 环境返回 False（需配合 --allow-non-admin，仅供本地联调）。
+    """
+    if os.name != "nt":
         return False
+    # 判定 1：IsUserAnAdmin
+    try:
+        if ctypes.windll.shell32.IsUserAnAdmin() != 0:
+            return True
+    except Exception:
+        pass
+    # 判定 2/3：CheckTokenMembership 检查 Administrators 组 与 内置 Administrator(RID 500)
+    try:
+        advapi32 = ctypes.windll.advapi32
+        kernel32 = ctypes.windll.kernel32
+
+        class SID_IDENTIFIER_AUTHORITY(ctypes.Structure):
+            _fields_ = [("Value", ctypes.c_ubyte * 6)]
+
+        class SID_AND_ATTRIBUTES(ctypes.Structure):
+            _fields_ = [("Sid", ctypes.c_void_p), ("Attributes", ctypes.c_ulong)]
+
+        def _make_admin_sid(sub_authority_count, sub_authorities, authority_bytes):
+            nta = SID_IDENTIFIER_AUTHORITY()
+            for i, b in enumerate(authority_bytes):
+                nta.Value[i] = b
+            p_sid = ctypes.c_void_p()
+            subs = (ctypes.c_ulong * sub_authority_count)(*sub_authorities)
+            ok = advapi32.AllocateAndInitializeSid(
+                ctypes.byref(nta), sub_authority_count,
+                *subs, ctypes.byref(p_sid)
+            )
+            if not ok:
+                return None
+            return p_sid
+
+        # Administrators 组：S-1-5-32-544（authority 5,32；sub 32,544）
+        sid_admin_group = _make_admin_sid(2, (32, 544), (0, 0, 0, 0, 0, 5))
+        # 内置 Administrator：S-1-5-21-...-500 无法仅靠固定 RID 构造，
+        # 用「Administrators 组成员」判定已覆盖绝大多数内置管理员场景。
+
+        if sid_admin_group:
+            try:
+                member = ctypes.c_int(0)
+                ok = advapi32.CheckTokenMembership(None, sid_admin_group, ctypes.byref(member))
+                if ok and member.value != 0:
+                    return True
+            finally:
+                advapi32.FreeSid(sid_admin_group)
+    except Exception:
+        pass
+    return False
 
 
 def ensure_admin(allow_non_admin: bool) -> None:
@@ -124,9 +193,7 @@ def _harden_acl_windows(path: str) -> None:
 
 def setup_log_dir(cfg: dict, allow_non_admin: bool) -> str:
     """创建日志目录并加固其访问权限。返回日志目录路径。"""
-    log_dir = cfg.get("log_dir") or os.path.join(
-        os.path.dirname(os.path.abspath(__file__)), "logs"
-    )
+    log_dir = cfg.get("log_dir") or os.path.join(app_dir(), "logs")
     os.makedirs(log_dir, exist_ok=True)
 
     if os.name == "nt" and not allow_non_admin:
@@ -554,7 +621,7 @@ def make_handler(cfg: dict, logger: AppLogger, dry_run: bool):
 # ----------------------------------------------------------------------------
 def main() -> int:
     parser = argparse.ArgumentParser(description="欲蓝财务魔方 Windows 服务端 APP")
-    parser.add_argument("--config", default=CONFIG_FILENAME, help="配置文件路径")
+    parser.add_argument("--config", default=None, help="配置文件路径（默认：exe 同目录的 yulan_cube_config.json）")
     parser.add_argument("--host", default=None, help="监听地址（覆盖配置）")
     parser.add_argument("--port", type=int, default=None, help="监听端口（覆盖配置）")
     parser.add_argument("--dry-run", action="store_true", help="不真正执行建号命令（联调用）")
@@ -566,7 +633,9 @@ def main() -> int:
     # 第 1 步：管理员检查（未通过直接退出，且不写任何日志文件）
     ensure_admin(args.allow_non_admin)
 
-    cfg = load_config(args.config)
+    # 未显式指定配置路径时，固定读取 exe 同目录的配置（打包后也正确）
+    config_path = args.config or os.path.join(app_dir(), CONFIG_FILENAME)
+    cfg = load_config(config_path)
 
     # 命令行覆盖
     if args.host:
