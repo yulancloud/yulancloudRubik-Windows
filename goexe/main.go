@@ -9,14 +9,16 @@
 //   - POST /api/v1/create-user：按 APP 配置决定普通/管理员角色，
 //     执行 net user / net localgroup 建号命令
 //   - POST /api/v1/update-user：以管理员权限强制修改已建账号
-//       改密码：net user 账号 新密码        （不需旧密码）
-//       改用户名：Rename-LocalUser          （可切 wmic 兼容老系统）
+//     改密码：net user 账号 新密码        （不需旧密码）
+//     改用户名：Rename-LocalUser          （可切 wmic 兼容老系统）
 //   - 日志一律脱敏：密码显示为 ***
 //
 // 命令契约（与网站端 YulanConnector 对接）：
-//   普通： net user 用户名 密码 /add
-//   管理员：再加 net localgroup administrators 用户名 /add
-//   两种都要： net localgroup "Remote Desktop Users" 用户名 /add
+//
+//	普通： net user 用户名 密码 /add
+//	管理员：再加 net localgroup administrators 用户名 /add
+//	两种都要： net localgroup "Remote Desktop Users" 用户名 /add
+//
 // =====================================================================
 package main
 
@@ -37,7 +39,7 @@ import (
 	"time"
 )
 
-const appVersion = "1.2.0"
+const appVersion = "1.2.1"
 
 // ---------------- 配置 ----------------
 
@@ -79,16 +81,16 @@ func loadConfig(path string) *Config {
 
 func defaultConfigSample() []byte {
 	sample := map[string]any{
-		"listen_host":       "0.0.0.0",
-		"listen_port":       8321,
-		"token":             "请改成一段足够长的随机口令，与网站后台「欲蓝服务器」里填的口令一致",
-		"default_role":      "user",
-		"admin_products":    []string{"填入走管理员角色的商品ID"},
-		"admin_group_name":  "administrators",
-		"rdp_group_name":    "Remote Desktop Users",
-		"server_ip":         "填本机对外 IP，仅作备注",
-		"use_powershell":    false,
-		"rename_method":     "powershell",
+		"listen_host":      "0.0.0.0",
+		"listen_port":      8321,
+		"token":            "请改成一段足够长的随机口令，与网站后台「欲蓝服务器」里填的口令一致",
+		"default_role":     "user",
+		"admin_products":   []string{"填入走管理员角色的商品ID"},
+		"admin_group_name": "administrators",
+		"rdp_group_name":   "Remote Desktop Users",
+		"server_ip":        "填本机对外 IP，仅作备注",
+		"use_powershell":   false,
+		"rename_method":    "powershell",
 	}
 	b, _ := json.MarshalIndent(sample, "", "  ")
 	return b
@@ -421,7 +423,7 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("/api/v1/health", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{
 			"ok": true, "service": "yulan-cube-app", "version": appVersion,
-			"capabilities": []string{"create-user", "update-user"},
+			"capabilities":  []string{"create-user", "update-user"},
 			"role_decision": "app", "server_ip": s.cfg.ServerIP,
 		})
 	})
@@ -461,8 +463,17 @@ func main() {
 	fmt.Printf("欲蓝财务魔方 APP v%s（Go 版单文件，无需任何运行环境）\n", appVersion)
 
 	// ---- 管理员门禁：Windows 下必须是管理员账号启动 ----
+	// 判定逻辑见 admin_windows.go：同时接受「UAC 提权令牌」与「管理员组成员身份」，
+	// 与 Python 版 IsUserAnAdmin 行为一致，避免域账号 / runas / 计划任务等场景误判。
 	if !isAdminRuntime() && !*allowNonAdmin {
-		fmt.Fprintln(os.Stderr, "❌ 本 APP 只能在管理员账号下运行：请右键「以管理员身份运行」，或使用 run_as_admin.bat 启动。")
+		msg := "本 APP 只能在管理员账号下运行。\n\n" +
+			"当前账号未被识别为管理员，请任选一种方式启动：\n" +
+			"  1) 右键本 exe →「以管理员身份运行」\n" +
+			"  2) 双击 run_as_admin.bat（会自动请求提权）\n" +
+			"  3) 用计划任务勾选「使用最高权限运行」启动\n\n" +
+			"如果你确认自己用的是管理员账号仍提示此错误，\n" +
+			"可在命令行加 --allow-non-admin 参数临时跳过检查（仅限排查）。"
+		fmt.Fprintln(os.Stderr, "❌ "+msg)
 		os.Exit(2)
 	}
 	if isAdminRuntime() {

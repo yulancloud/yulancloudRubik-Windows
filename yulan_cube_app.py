@@ -56,7 +56,7 @@ from urllib.parse import urlparse
 DEFAULT_PORT = 8321
 DEFAULT_HOST = "0.0.0.0"
 CONFIG_FILENAME = "yulan_cube_config.json"
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.2.1"
 
 # Windows 已知 SID
 SID_SYSTEM = "S-1-5-18"          # SYSTEM
